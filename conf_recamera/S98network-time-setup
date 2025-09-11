@@ -1,0 +1,162 @@
+#!/bin/sh
+
+### BEGIN INIT INFO
+# Provides:          network-time-setup
+# Required-Start:    $local_fs $syslog
+# Required-Stop:     $local_fs $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Setup network connection and system time
+# Description:       Configure WiFi, check internet connectivity and update system time
+### END INIT INFO
+
+NAME=network-time-setup
+DESC="Network and Time Setup"
+LOGFILE=/var/log/$NAME.log
+MAX_RETRIES=10
+RETRY_DELAY=5
+
+# Configuración WiFi (ajusta según tu sistema)
+WIFI_IFACE=wlan0
+WIFI_CONFIG=/etc/wpa_supplicant.conf
+
+check_internet() {
+    echo "$(date) - Checking internet connectivity..." >> $LOGFILE
+    ping -c 3 -W 5 8.8.8.8 >/dev/null 2>&1
+    return $?
+}
+
+update_system_time() {
+    echo "$(date) - Updating system time..." >> $LOGFILE
+    
+    # Verificar si la fecha actual es válida (después de 2020)
+    CURRENT_TS=$(date +%s)
+    MIN_VALID_TS=1600000000   # ~2020-09-13
+    
+    if [ $CURRENT_TS -lt $MIN_VALID_TS ]; then
+        echo "$(date) - System date is invalid ($CURRENT_TS), attempting NTP sync..." >> $LOGFILE
+        
+        # Intentar sincronizar con NTP
+        if command -v ntpd >/dev/null 2>&1; then
+            ntpd -q -n -p pool.ntp.org >> $LOGFILE 2>&1
+        elif command -v ntpdate >/dev/null 2>&1; then
+            ntpdate -s pool.ntp.org >> $LOGFILE 2>&1
+        elif command -v rdate >/dev/null 2>&1; then
+            rdate -s time.nist.gov >> $LOGFILE 2>&1
+        else
+            echo "$(date) - No NTP client found, cannot update time" >> $LOGFILE
+            return 1
+        fi
+        
+        # Verificar si se actualizó correctamente
+        NEW_TS=$(date +%s)
+        if [ $NEW_TS -ge $MIN_VALID_TS ]; then
+            echo "$(date) - Time updated successfully (new timestamp: $NEW_TS)" >> $LOGFILE
+            return 0
+        else
+            echo "$(date) - Time update failed (still invalid: $NEW_TS)" >> $LOGFILE
+            return 1
+        fi
+    else
+        echo "$(date) - System time is already valid ($CURRENT_TS)" >> $LOGFILE
+        return 0
+    fi
+}
+
+setup_wifi() {
+    echo "$(date) - Setting up WiFi interface $WIFI_IFACE..." >> $LOGFILE
+    
+    # Verificar si la interfaz WiFi existe
+    if ! ip link show $WIFI_IFACE >/dev/null 2>&1; then
+        echo "$(date) - WiFi interface $WIFI_IFACE not found" >> $LOGFILE
+        return 1
+    fi
+    
+    # Activar interfaz WiFi
+    ifconfig $WIFI_IFACE up >> $LOGFILE 2>&1
+    
+    # Configurar WiFi si existe el archivo de configuración
+    if [ -f "$WIFI_CONFIG" ]; then
+        echo "$(date) - Configuring WiFi with $WIFI_CONFIG..." >> $LOGFILE
+        wpa_supplicant -B -i $WIFI_IFACE -c $WIFI_CONFIG >> $LOGFILE 2>&1
+        sleep 3
+    fi
+    
+    # Intentar obtener IP via DHCP
+    echo "$(date) - Requesting IP address via DHCP..." >> $LOGFILE
+    udhcpc -i $WIFI_IFACE -n >> $LOGFILE 2>&1
+    
+    return 0
+}
+
+start() {
+    echo "==============================" >> $LOGFILE
+    echo "$(date) - STARTING $DESC" >> $LOGFILE
+    
+    # Configurar WiFi
+    setup_wifi
+    
+    # Intentar conectar a internet y actualizar hora
+    RETRY=0
+    while [ $RETRY -lt $MAX_RETRIES ]; do
+        if check_internet; then
+            echo "$(date) - Internet connection successful" >> $LOGFILE
+            if update_system_time; then
+                echo "$(date) - $DESC completed successfully" >> $LOGFILE
+                echo "==============================" >> $LOGFILE
+                return 0
+            fi
+        else
+            echo "$(date) - Internet check failed (attempt $((RETRY+1))/$MAX_RETRIES)" >> $LOGFILE
+        fi
+        
+        RETRY=$((RETRY+1))
+        sleep $RETRY_DELAY
+    done
+    
+    echo "$(date) - $DESC failed after $MAX_RETRIES attempts" >> $LOGFILE
+    echo "==============================" >> $LOGFILE
+    return 1
+}
+
+stop() {
+    echo "$(date) - Stopping $DESC" >> $LOGFILE
+    # Limpiar procesos de WiFi si es necesario
+    pkill wpa_supplicant
+    pkill udhcpc
+}
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        sleep 2
+        start
+        ;;
+    status)
+        if check_internet; then
+            echo "Internet connection: OK"
+        else
+            echo "Internet connection: FAILED"
+        fi
+        
+        CURRENT_TS=$(date +%s)
+        MIN_VALID_TS=1600000000
+        if [ $CURRENT_TS -ge $MIN_VALID_TS ]; then
+            echo "System time: VALID ($(date))"
+        else
+            echo "System time: INVALID ($(date))"
+        fi
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac
+
+exit 0
